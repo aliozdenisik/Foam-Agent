@@ -216,7 +216,7 @@ dependencies:
   - openjpeg=2.5.3
   - openldap=2.6.9
   - openssl=3.4.1
-  - packaging=24.2
+  - packaging>=26.2
   - pango=1.56.1
   - pcre2=10.44
   - pillow=11.1.0
@@ -446,6 +446,7 @@ dependencies:
       - numpy==1.26.4
       - ollama==0.4.8
       - openai==1.61.1
+      - openai-codex==0.160.1
       - openapi-core==0.19.5
       - openapi-pydantic==0.5.1
       - openapi-schema-validator==0.6.3

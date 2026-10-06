@@ -124,48 +124,15 @@ class FoamPydantic(BaseModel):
     list_foamfile: List[FoamfilePydantic] = Field(description="List of OpenFOAM configuration files")
 
 class _CodexResponsesWrapper:
-    """Wrapper for an OpenAI Responses-compatible endpoint.
-
-    This mimics the minimal interface LLMService expects from LangChain chat models:
-    - invoke(messages) -> object with .content
-    - get_num_tokens(text) -> int
-
-    We support two wire endpoints:
-    - OpenAI Platform: https://api.openai.com/v1/responses (API key / some OAuth tokens)
-    - ChatGPT/Codex subscription backend: https://chatgpt.com/backend-api/codex/responses
-
-    The ChatGPT backend requires a non-empty `instructions` field that matches the Codex harness
-    expectations. We ship a default copy in `src/codex_instructions_default.txt`.
-    """
+    """Keep the existing completion interface over Codex-managed authentication."""
 
     class _Resp:
         def __init__(self, content: str):
             self.content = content
 
-    def __init__(
-        self,
-        token: str,
-        model: str,
-        temperature: float = 0.0,
-        *,
-        base_url: str = "https://api.openai.com/v1",
-        account_id: Optional[str] = None,
-        instructions: Optional[str] = None,
-        stream: bool = False,
-    ):
-        self._token = token
+    def __init__(self, model: str):
         self._model = model
-        self._temperature = temperature
-        self._base_url = base_url.rstrip("/")
-        self._account_id = account_id
-        self._instructions = instructions
-        self._stream = stream
-        # Token counting (best-effort). Exact tokenization may differ by model.
-        # We default to a modern tokenizer; adjust if you need model-specific counting.
-        try:
-            self._enc = tiktoken.get_encoding("o200k_base")
-        except (KeyError, ValueError):
-            self._enc = tiktoken.get_encoding("cl100k_base")
+        self._enc = tiktoken.get_encoding("o200k_base")
 
     def get_num_tokens(self, text: str) -> int:
         return len(self._enc.encode(text or ""))
@@ -222,277 +189,12 @@ class _CodexResponsesWrapper:
 
         return _StructuredWrapper()
 
-    @staticmethod
-    def _to_responses_input(messages):
-        out = []
-        for m in messages:
-            role = m.get("role")
-            content = m.get("content", "")
-            # Responses API supports rich content; we use simple input_text.
-            out.append({"role": role, "content": [{"type": "input_text", "text": content}]})
-        return out
-
-    @staticmethod
-    def _extract_output_text(resp_json: dict) -> str:
-        # Newer APIs often include output_text; fall back to traversing.
-        if isinstance(resp_json, dict) and isinstance(resp_json.get("output_text"), str):
-            return resp_json["output_text"]
-
-        texts = []
-        for item in resp_json.get("output", []) if isinstance(resp_json, dict) else []:
-            for c in item.get("content", []) if isinstance(item, dict) else []:
-                if isinstance(c, dict):
-                    if c.get("type") in {"output_text", "text"} and isinstance(c.get("text"), str):
-                        texts.append(c["text"])
-        return "\n".join(texts).strip()
-
-    def _build_payload(self, messages):
-        payload = {
-            "model": self._model,
-            "input": self._to_responses_input(messages),
-        }
-
-        # OpenAI Platform supports temperature.
-        if "chatgpt.com" not in self._base_url:
-            payload["temperature"] = self._temperature
-
-        # ChatGPT/Codex subscription backend expects these extra keys.
-        if "chatgpt.com" in self._base_url:
-            payload.update(
-                {
-                    "instructions": self._instructions or "",
-                    "tools": [],
-                    "tool_choice": "auto",
-                    "parallel_tool_calls": False,
-                    "reasoning": {"summary": "auto"},
-                    "store": False,
-                    "stream": bool(self._stream),
-                    "include": ["reasoning.encrypted_content"],
-                }
-            )
-        return payload
-
-    @staticmethod
-    def _iter_sse_text(resp: requests.Response):
-        """Yield decoded SSE 'data:' payloads as strings."""
-        for raw in resp.iter_lines(decode_unicode=True):
-            if not raw:
-                continue
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            line = str(raw).strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:") :].strip()
-            if data == "[DONE]":
-                break
-            yield data
-
     def invoke(self, messages):
-        url = f"{self._base_url}/responses"
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json" if not self._stream else "text/event-stream",
-            "User-Agent": "Foam-Agent",
-        }
-        if self._account_id:
-            headers["ChatGPT-Account-Id"] = self._account_id
+        from codex_provider import complete
 
-        payload = self._build_payload(messages)
-
-        # ChatGPT Codex backend can take 60-180s on complex prompts when
-        # reasoning.summary=auto is enabled — the model spends time on the
-        # reasoning trace before emitting tokens. The previous hardcoded 60s
-        # was too tight: prompts with non-trivial BC topology (e.g. a 2-inlet
-        # elbow channel) deterministically exceeded it on gpt-5.5, raising
-        # `HTTPSConnectionPool ... Read timed out. (read timeout=60)` and
-        # failing the workflow. Allow operator override via env var.
-        timeout = int(os.environ.get("FOAMAGENT_HTTP_TIMEOUT", "300"))
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=bool(self._stream))
-
-        # If we get an error, surface the response body to aid debugging.
-        if not r.ok:
-            try:
-                detail = r.text[:2000]
-            except Exception:
-                detail = ""
-            raise requests.HTTPError(
-                f"HTTP {r.status_code} for {url}. Body: {detail}", response=r
-            )
-
-        if not self._stream:
-            data = r.json()
-            return self._Resp(self._extract_output_text(data))
-
-        # Streaming: accumulate text deltas.
-        import json
-
-        chunks: list[str] = []
-        for s in self._iter_sse_text(r):
-            try:
-                j = json.loads(s)
-            except Exception:
-                continue
-
-            # Codex backend streams OpenAI Responses-style events.
-            if isinstance(j, dict):
-                t = j.get("type")
-                if t == "response.output_text.delta" and isinstance(j.get("delta"), str):
-                    chunks.append(j["delta"])
-                    continue
-                if t == "response.output_text.done" and isinstance(j.get("text"), str):
-                    # Some clients rely on done; we already collected deltas but keep as fallback.
-                    if not chunks:
-                        chunks.append(j["text"])
-                    continue
-
-            # Fallback: try generic extraction.
-            t2 = self._extract_output_text(j)
-            if t2:
-                chunks.append(t2)
-
-        return self._Resp("".join(chunks).strip())
-
+        return self._Resp(complete(messages, self._model).strip())
 
 class LLMService:
-    @staticmethod
-    def _load_codex_oauth_from_auth_json(auth_json_path: Path) -> tuple[str, Optional[str]]:
-        import json
-
-        data = json.loads(auth_json_path.read_text(encoding="utf-8"))
-
-        # Be permissive: different Codex versions may store different shapes.
-        # Common patterns we try:
-        #   {"access_token": "..."}
-        #   {"token": "..."}
-        #   {"tokens": {"access_token": "...", "account_id": "..."}}
-        #   {"auth": {"access_token": "..."}}
-        #   {"credentials": {"access_token": "..."}}
-        candidates = []
-        account_id = None
-
-        def maybe_add(v):
-            if isinstance(v, str) and v.strip():
-                candidates.append(v.strip())
-
-        if isinstance(data, dict):
-            maybe_add(data.get("access_token"))
-            maybe_add(data.get("token"))
-
-            for k in ("auth", "credentials", "session"):
-                v = data.get(k)
-                if isinstance(v, dict):
-                    maybe_add(v.get("access_token"))
-                    maybe_add(v.get("token"))
-
-            tokens = data.get("tokens")
-            if isinstance(tokens, dict):
-                maybe_add(tokens.get("access_token"))
-                maybe_add(tokens.get("token"))
-                if isinstance(tokens.get("account_id"), str) and tokens["account_id"].strip():
-                    account_id = tokens["account_id"].strip()
-
-        if not candidates:
-            raise ValueError(
-                f"Could not find an access token in {auth_json_path}. "
-                "Expected keys like access_token/token or tokens.access_token."
-            )
-
-        # Prefer access_token-like strings first (we already appended in that order)
-        return candidates[0], account_id
-
-    @staticmethod
-    def _load_codex_oauth_from_clawdbot_auth_profiles(auth_profiles_path: Path) -> tuple[str, Optional[str]]:
-        """Load (access token, account id) from Clawdbot's OpenAI-Codex OAuth cache.
-
-        Expected shape (v1):
-          {"profiles": {"openai-codex:default": {"access": "...", "accountId": "...", ...}}}
-
-        We also fall back to "openai-codex" or any first profile that looks usable.
-        """
-        import json
-
-        data = json.loads(auth_profiles_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError(f"Unexpected JSON in {auth_profiles_path}")
-
-        profiles = data.get("profiles")
-        if not isinstance(profiles, dict):
-            raise ValueError(f"Missing 'profiles' in {auth_profiles_path}")
-
-        preferred_keys = ["openai-codex:default", "openai-codex"]
-        for k in preferred_keys:
-            v = profiles.get(k)
-            if isinstance(v, dict):
-                token = v.get("access")
-                account_id = v.get("accountId")
-                if isinstance(token, str) and token.strip():
-                    return token.strip(), account_id if isinstance(account_id, str) else None
-
-        # Fallback: scan any profile entry that has an 'access' string
-        for _, v in profiles.items():
-            if isinstance(v, dict):
-                token = v.get("access")
-                account_id = v.get("accountId")
-                if isinstance(token, str) and token.strip():
-                    return token.strip(), account_id if isinstance(account_id, str) else None
-
-        raise ValueError(
-            f"Could not find an 'access' token in {auth_profiles_path}. "
-            "Expected profiles[*].access"
-        )
-
-    def _load_codex_oauth(self) -> tuple[str, Optional[str]]:
-        """Load the Codex/ChatGPT OAuth token from a local auth cache.
-
-        Supported locations (first match wins):
-        1) $CODEX_HOME/auth.json (Codex CLI file-based cache)
-        2) ~/.codex/auth.json (Codex CLI default)
-        3) ~/.clawdbot/agents/main/agent/auth-profiles.json (Clawdbot OpenAI-Codex OAuth cache)
-
-        Note: These files contain access/refresh tokens. Treat them like passwords.
-        """
-        candidates: list[Path] = []
-
-        codex_home = os.getenv("CODEX_HOME")
-        if codex_home:
-            candidates.append(Path(codex_home) / "auth.json")
-
-        candidates.append(Path.home() / ".codex" / "auth.json")
-
-        # Clawdbot stores the OpenAI-Codex OAuth profile here.
-        candidates.append(
-            Path.home()
-            / ".clawdbot"
-            / "agents"
-            / "main"
-            / "agent"
-            / "auth-profiles.json"
-        )
-
-        for p in candidates:
-            if not p.exists():
-                continue
-
-            # Codex CLI cache
-            if p.name == "auth.json":
-                return self._load_codex_oauth_from_auth_json(p)
-
-            # Clawdbot cache
-            if p.name == "auth-profiles.json":
-                return self._load_codex_oauth_from_clawdbot_auth_profiles(p)
-
-        raise FileNotFoundError(
-            "model_provider='openai-codex' requires a Codex/ChatGPT OAuth cache. "
-            "Looked for: "
-            + ", ".join(str(x) for x in candidates)
-            + ". "
-            "If you used the Codex CLI, run `codex login` and ensure file-based credential storage. "
-            "If you used Clawdbot, make sure you completed OpenAI Codex OAuth in onboarding. "
-            "To use an OpenAI Platform API key instead, set "
-            "FOAMAGENT_MODEL_PROVIDER=openai along with OPENAI_API_KEY."
-        )
 
     def __init__(self, config: object):
         self.model_version = getattr(config, "model_version", "gpt-4o")
@@ -530,27 +232,7 @@ class LLMService:
                 temperature=self.temperature,
             )
         elif self.model_provider.lower() in {"openai-codex", "codex", "chatgpt-oauth"}:
-            # Subscription-based access via "Sign in with ChatGPT" (Codex auth cache).
-            # We use the OpenAI Responses API, which is the typical surface for Codex subscription access.
-            token, account_id = self._load_codex_oauth()
-
-            # ChatGPT/Codex subscription route: use the same endpoint as Codex CLI.
-            # This avoids requiring Platform API scopes like api.responses.write.
-            instructions_path = Path(__file__).resolve().parent / "codex_instructions_default.txt"
-            try:
-                instructions = instructions_path.read_text(encoding="utf-8")
-            except OSError:
-                instructions = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."
-
-            self.llm = _CodexResponsesWrapper(
-                token=token,
-                account_id=account_id,
-                model=self.model_version,
-                temperature=self.temperature,
-                base_url="https://chatgpt.com/backend-api/codex",
-                instructions=instructions,
-                stream=True,
-            )
+            self.llm = _CodexResponsesWrapper(model=self.model_version)
         elif self.model_provider.lower() == "ollama":
             try:
                 requests.get("http://localhost:11434/api/version", timeout=2)

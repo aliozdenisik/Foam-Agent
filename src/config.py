@@ -38,7 +38,7 @@ class Config:
     # - Ollama: "qwen2.5:32b-instruct"
     # - Bedrock: application inference profile ARN
     # - Anthropic: claude-3-5-sonnet-latest
-    model_version: str = "gpt-5.3-codex"
+    model_version: str | None = None
     temperature: float = 1
     openfoam_fork: str = "foundation"  # Default to Foundation v10
     # An explicit target is additive.  Leaving it empty keeps the existing
@@ -79,6 +79,12 @@ class Config:
                 )
         else:
             print(f"<config>model_provider={self.model_provider} (default)</config>")
+
+        if self.model_version is None:
+            self.model_version = {
+                "openai-codex": "auto",
+                "openai": "gpt-5-mini",
+            }.get(self.model_provider, "gpt-5.3-codex")
 
         version_env = _env_nonempty(version_key)
         if version_env is not None:

@@ -102,9 +102,9 @@ Settings live in `src/config.py` with sensible defaults. The supported environme
 | Environment Variable | Purpose | Allowed Values |
 |---|---|---|
 | `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai`, `openai-codex`, `anthropic`, `bedrock`, `ollama`, `deepseek` |
-| `FOAMAGENT_MODEL_VERSION` | Model identifier | A model supported by the selected provider; default `gpt-5.3-codex` |
+| `FOAMAGENT_MODEL_VERSION` | Model identifier | A model supported by the selected provider; default `auto` (Codex catalog default) |
 
-The default provider is `openai-codex`, which reads an OAuth token cache. Setting `OPENAI_API_KEY` alone does not switch to the `openai` provider; set both provider and model for API-key usage.
+The default provider is `openai-codex`, which uses the official Codex SDK and its existing authentication. Setting `OPENAI_API_KEY` alone does not switch to the `openai` provider; set both provider and model for API-key usage. See [Authentication](#authentication).
 
 Example:
 ```bash
@@ -275,30 +275,43 @@ This triggers the full pipeline: plan -> generate files -> run -> review/fix loo
 
 This skill orchestrates individual MCP tools on the client, with up to five repair iterations and optional visualization. Those tools do not run the CLI's complete graph automatically; the standalone `run` tool is local-only. Use the CLI graph for generated-case Gmsh/custom-mesh or HPC routing, and `run_case` for the imported-case graph.
 
-### Codex OAuth Sign-in (No API Key)
+### Authentication
 
-If you have a ChatGPT/Codex subscription, you can authenticate via OAuth instead of an API key:
+**ChatGPT subscription:** The default `openai-codex` provider uses the official [Codex Python SDK](https://github.com/openai/codex/blob/main/sdk/python/README.md). Codex access depends on your ChatGPT plan, account permissions, and usage limits; signing in does not guarantee access to every model. The default model `auto` selects the SDK catalog default. `models` lists catalog identifiers, not proof that every listed model is entitled for your account.
 
-1. Install the [Codex CLI](https://github.com/openai/codex) on your host machine.
-2. Run `codex login` and choose **"Sign in with ChatGPT"**.
-3. Verify the token cache exists: `ls ~/.codex/auth.json`
-4. Mount it into the container:
+Run these commands from the repository root with the Python environment used for Foam-Agent. If the SDK is missing, install the supported version:
 
 ```bash
-docker run -it \
-  -e FOAMAGENT_MODEL_PROVIDER=openai-codex \
-  -e FOAMAGENT_MODEL_VERSION=gpt-5.3-codex \
-  -v ~/.codex/auth.json:/root/.codex/auth.json:ro \
-  -p 7860:7860 \
-  leoyue123/foamagent
+uv pip install --python .venv/bin/python "openai-codex==0.160.1"
 ```
 
-Foam-Agent searches for OAuth tokens at (first match wins):
-- `$CODEX_HOME/auth.json`
-- `~/.codex/auth.json`
-- `~/.clawdbot/agents/main/agent/auth-profiles.json`
+```bash
+python -m src.codex_auth status
+python -m src.codex_auth models
+python -m src.codex_auth login
+```
 
-> Security note: `auth.json` contains access tokens. Treat it like a password.
+`login` first refreshes and reuses an existing ChatGPT session without starting another authorization. Otherwise it prints the exact official URL: open it, sign in with your ChatGPT account, approve Codex access, and finish the browser redirect. Add `--open-browser` to open that URL automatically. The command waits up to 300 seconds; use `--timeout SECONDS` to change the limit.
+
+For a headless machine or container, use device authorization:
+
+```bash
+python -m src.codex_auth login --device-code
+```
+
+Open the printed verification URL on a browser-enabled device, enter the printed code, sign in, and approve device access. Your account or workspace must allow device-code login; enable device-code authorization in ChatGPT security settings if required by the official flow. `status` prints only the authentication mode; `models` prints only model identifiers, with no email, account ID, or tokens.
+
+The SDK reuses Codex's credential store, including configured keyring storage, and handles token refresh. Foam-Agent does not extract tokens from `auth.json`. Host keyring credentials are not automatically available inside Docker; authenticate in the environment that runs Foam-Agent rather than copying or mounting an extracted credential file.
+
+**OpenAI Platform API key:** This is separate usage-based billing, not included in a ChatGPT subscription. Explicitly select the API-key provider and an API model, and supply your own key:
+
+```bash
+export FOAMAGENT_MODEL_PROVIDER=openai
+export FOAMAGENT_MODEL_VERSION=gpt-5-mini
+export OPENAI_API_KEY=your-key-here
+```
+
+**Embeddings:** ChatGPT/Codex subscription sign-in provides no OpenAI Platform embeddings entitlement. The default Hugging Face `Qwen/Qwen3-Embedding-0.6B` runs locally without an API key. Selecting OpenAI embeddings requires a separately billed Platform API key (`OPENAI_API_KEY`) and indices built for the chosen embedding model, even when the LLM provider remains `openai-codex`.
 
 ### Manual Installation (Without Docker)
 
